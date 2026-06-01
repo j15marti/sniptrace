@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# sniptrace v1.1.0
+# Strip noisy terminal output before it reaches your AI coding agent.
+# https://sniptrace.com
+
+VERSION="1.1.0"
+JSON_MODE=false
+ARGS=()
+
+# ── Config ───────────────────────────────────────────────────────────────────
+# Telemetry is OFF by default. Settings live in a small local file you control.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sniptrace"
+CONFIG_FILE="$CONFIG_DIR/config"
+API_BASE="${SNIPTRACE_API:-https://sniptrace.com}"
+
+_cfg_get() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  grep -E "^$1=" "$CONFIG_FILE" 2>/dev/null | head -n1 | cut -d= -f2-
+}
+
+_cfg_set() {
+  local key="$1" val="$2" tmp
+  mkdir -p "$CONFIG_DIR" 2>/dev/null || return 1
+  touch "$CONFIG_FILE" 2>/dev/null || return 1
+  if grep -qE "^$key=" "$CONFIG_FILE" 2>/dev/null; then
+    tmp=$(mktemp)
+    grep -vE "^$key=" "$CONFIG_FILE" > "$tmp"
+    echo "$key=$val" >> "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+  else
+    echo "$key=$val" >> "$CONFIG_FILE"
+  fi
+  chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+}
+
+# Stable anonymous identifier, generated once and reused.
+_client_id() {
+  local id
+  id=$(_cfg_get CLIENT_ID)
+  if [[ -z "$id" ]]; then
+    id=$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')
+    [[ -z "$id" ]] && id=$(python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null)
+    [[ -z "$id" ]] && id="anon-$(date +%s 2>/dev/null)-$RANDOM"
+    _cfg_set CLIENT_ID "$id"
+  fi
+  echo "$id"
+}
+
+_detect_cmdtype() {
+  case "${1:-}" in
+    pnpm|npm|yarn|node|npx)   echo "node" ;;
+    docker)                   echo "docker" ;;
+    pytest|jest|vitest)       echo "test" ;;
+    python|python3|pip|pip3)  echo "python" ;;
+    *)                        echo "generic" ;;
+  esac
+}
+
+# Minimal JSON string escaping (backslash and double-quote).
+_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# Build a JSON body and POST it to the telemetry endpoint. Silent on failure.
+# Pure bash — no python dependency, so it works on any POSIX machine with curl.
+_sniptrace_post() {
+  local cid="$1" tier="$2" cmdtype="$3" used="$4" saved="$5" email="$6" freq="$7" payload
+  [[ -z "$cid" ]] && return
+  used=${used:-0}; saved=${saved:-0}
+  payload="{\"clientId\":\"$(_json_escape "$cid")\""
+  payload="${payload},\"tier\":\"$(_json_escape "${tier:-counter}")\""
+  payload="${payload},\"commandType\":\"$(_json_escape "${cmdtype:-generic}")\""
+  payload="${payload},\"tokensUsed\":${used},\"tokensSaved\":${saved}"
+  [[ -n "$email" ]] && payload="${payload},\"email\":\"$(_json_escape "$email")\""
+  [[ -n "$freq"  ]] && payload="${payload},\"frequency\":\"$(_json_escape "$freq")\""
+  payload="${payload}}"
+  curl -fsS --max-time 3 -X POST \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "$API_BASE/api/v1/events" >/dev/null 2>&1 || true
+}
+
+# ── Telemetry opt-in / opt-out / status ──────────────────────────────────────
+_tele_on() {
+  local cid email="" tier="counter" freq=""
+  cid=$(_client_id)
+
+  # No terminal attached (e.g. piped/CI) — enable anonymous counts only.
+  if [[ ! -t 0 ]]; then
+    _cfg_set TELEMETRY on
+    _cfg_set TIER counter
+    _cfg_set EMAIL ""
+    _cfg_set FREQUENCY ""
+    echo "sniptrace: telemetry is now ON (anonymous token counts only)."
+    echo "           Run 'sniptrace tele --on' in a terminal to add email reports."
+    ( _sniptrace_post "$cid" counter subscribe 0 0 "" "" & )
+    return
+  fi
+
+  echo ""
+  echo "  Turning on SnipTrace telemetry."
+  echo ""
+  echo "  It is anonymous: SnipTrace only sends a count of tokens used and tokens"
+  echo "  saved. Your code, your commands, and your terminal output never leave"
+  echo "  your machine."
+  echo ""
+
+  read -r -p "  Email for periodic savings reports (optional — press Enter to skip): " email
+  email="${email// /}"
+
+  if [[ -n "$email" ]]; then
+    if [[ "$email" != *"@"*"."* ]]; then
+      echo "  That doesn't look like an email address — skipping email reports."
+      email=""
+    else
+      tier="email"
+      echo ""
+      echo "  How often would you like reports?"
+      echo "    1) hourly     2) daily     3) weekly     4) monthly"
+      local choice=""
+      read -r -p "  Choose 1-4 (press Enter for weekly): " choice
+      case "$choice" in
+        1) freq="hourly" ;;
+        2) freq="daily" ;;
+        4) freq="monthly" ;;
+        *) freq="weekly" ;;
+      esac
+    fi
+  fi
+
+  _cfg_set TELEMETRY on
+  _cfg_set TIER "$tier"
+  _cfg_set EMAIL "$email"
+  _cfg_set FREQUENCY "$freq"
+
+  echo ""
+  echo "  ✓ Telemetry is ON."
+  if [[ -n "$email" ]]; then
+    echo "  ✓ Reports will go to $email ($freq)."
+    echo ""
+    echo "    Each report shows your tokens used, tokens saved, and the dollar"
+    echo "    cost saved — priced from a blended average of current published LLM API rates, refreshed nightly."
+  else
+    echo "    Only anonymous token counts are sent. No email reports."
+  fi
+  echo ""
+  echo "  Change anytime:  sniptrace tele --off   |   sniptrace tele --status"
+  echo ""
+
+  ( _sniptrace_post "$cid" "$tier" subscribe 0 0 "$email" "$freq" & )
+}
+
+_tele_off() {
+  _cfg_set TELEMETRY off
+  echo "sniptrace: telemetry is now OFF. Nothing will be sent."
+}
+
+_tele_status() {
+  local t email freq tier
+  t=$(_cfg_get TELEMETRY)
+  echo ""
+  if [[ "$t" == "on" ]]; then
+    email=$(_cfg_get EMAIL)
+    freq=$(_cfg_get FREQUENCY)
+    tier=$(_cfg_get TIER)
+    echo "  Telemetry: ON"
+    echo "  Tier:      ${tier:-counter}"
+    if [[ -n "$email" ]]; then
+      echo "  Email:     $email"
+      echo "  Reports:   ${freq:-weekly}"
+    else
+      echo "  Email:     (none — anonymous token counts only)"
+    fi
+    echo "  Turn off:  sniptrace tele --off"
+  else
+    echo "  Telemetry: OFF (default). Nothing is sent."
+    echo "  Turn on:   sniptrace tele --on"
+  fi
+  echo ""
+  echo "  Client ID: $(_client_id)"
+  echo "  Config:    $CONFIG_FILE"
+  echo "  Privacy:   https://sniptrace.com/privacy"
+  echo ""
+}
+
+# ── Global on/off toggle ─────────────────────────────────────────────────────
+# Filtering is ON by default. Users can pause it instantly from the CLI
+# (`sniptrace off`) or from code/CI by exporting SNIPTRACE_DISABLED.
+_is_disabled() {
+  # Environment override wins — handy for scripts, CI, or a single project.
+  case "${SNIPTRACE_DISABLED:-}" in
+    1|true|TRUE|yes|on) return 0 ;;
+  esac
+  [[ "$(_cfg_get ENABLED)" == "off" ]]
+}
+
+_set_enabled() {
+  _cfg_set ENABLED "$1"
+  if [[ "$1" == "on" ]]; then
+    echo "sniptrace: filtering is now ON. Wrapped commands will be trimmed."
+  else
+    echo "sniptrace: filtering is now OFF. Commands run untouched (pass-through)."
+    echo "           Turn it back on with:  sniptrace on"
+  fi
+}
+
+_status() {
+  echo ""
+  if _is_disabled; then
+    echo "  Filtering: OFF — commands run untouched."
+    if [[ -n "${SNIPTRACE_DISABLED:-}" ]]; then
+      echo "             (disabled by SNIPTRACE_DISABLED in your environment)"
+    fi
+    echo "  Turn on:   sniptrace on"
+  else
+    echo "  Filtering: ON — noisy output is trimmed before it reaches your agent."
+    echo "  Turn off:  sniptrace off"
+  fi
+  echo ""
+  echo "  Telemetry: run 'sniptrace tele --status' for telemetry settings."
+  echo "  Config:    $CONFIG_FILE"
+  echo ""
+}
+
+_print_help() {
+  cat << 'HELPEOF'
+sniptrace — trim noisy terminal output before it reaches your AI coding agent
+
+USAGE
+  sniptrace <command> [args...]      Run a command and print filtered output
+  sniptrace --json <command> ...     Filtered output as structured JSON
+
+SETUP
+  sniptrace shell-init               Auto-filter noisy commands in your shell
+  sniptrace init                     Add an AGENTS.md rule for AI agents
+
+CONTROL  (filtering is ON by default)
+  sniptrace on                       Turn filtering on
+  sniptrace off                      Turn filtering off (commands run untouched)
+  sniptrace status                   Show whether filtering is on or off
+                                     Tip: export SNIPTRACE_DISABLED=1 to turn it
+                                     off from code/CI without changing settings.
+
+TELEMETRY  (optional — OFF by default)
+  sniptrace tele --on                Turn on telemetry (asks a few quick questions)
+  sniptrace tele --off               Turn telemetry off
+  sniptrace tele --status            Show your current telemetry settings
+
+OTHER
+  sniptrace --version                Print the installed version
+  sniptrace help                     Show this help
+
+ABOUT TELEMETRY
+  Telemetry is opt-in. When on, SnipTrace sends an anonymous count of tokens
+  used and tokens saved so we can power the public counter at sniptrace.com.
+  Your code, commands, and terminal output never leave your machine.
+
+  If you add your email when turning it on, we can send you periodic reports
+  (hourly, daily, weekly, or monthly) of your tokens used, tokens saved, and
+  the dollar cost saved — priced from a blended average of current published LLM API rates, refreshed nightly.
+
+  Full details: https://sniptrace.com/privacy
+HELPEOF
+}
+
+# ── On/off & status (only as the first word, so they never shadow commands) ──
+case "${1:-}" in
+  on|enable)   _set_enabled on;  exit 0 ;;
+  off|disable) _set_enabled off; exit 0 ;;
+  status)      _status;          exit 0 ;;
+esac
+
+# ── Argument parsing ─────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)        JSON_MODE=true; shift ;;
+    --version|-v)  echo "sniptrace $VERSION"; exit 0 ;;
+    -h|--help|help) _print_help; exit 0 ;;
+
+    tele)
+      case "${2:-status}" in
+        --on|on|-on)              _tele_on ;;
+        --off|off|-off)           _tele_off ;;
+        --status|status|-status)  _tele_status ;;
+        *)
+          echo "sniptrace: unknown option 'tele ${2}'." >&2
+          echo "           Use: sniptrace tele --on | --off | --status" >&2
+          exit 1 ;;
+      esac
+      exit 0
+      ;;
+
+    config)  # backwards-friendly alias
+      _tele_status
+      exit 0
+      ;;
+
+    init)
+      DEST="${2:-AGENTS.md}"
+      MARKER="# SnipTrace"
+
+      if [[ -f "$DEST" ]] && grep -qF "$MARKER" "$DEST" 2>/dev/null; then
+        echo "sniptrace: SnipTrace block already present in $DEST — nothing to do."
+        exit 0
+      fi
+
+      # Build the block to add
+      BLOCK='
+# SnipTrace
+
+SnipTrace is installed in this project. You MUST prefix the commands listed
+below with `sniptrace` every time you run them — do not run them bare.
+This reduces the tokens sent to the LLM by stripping noise before output
+reaches the context window.
+
+## Rule
+
+Always run these commands through sniptrace:
+
+  sniptrace pytest [args...]
+  sniptrace docker build [args...]
+  sniptrace pnpm install
+  sniptrace pnpm run build
+  sniptrace pnpm run typecheck
+  sniptrace npm ci
+  sniptrace npm install
+
+Do not run pytest, docker build, pnpm install, or npm ci directly.
+
+## Usage
+
+  sniptrace <command> [args...]          # filtered output
+  sniptrace --json <command> [args...]   # structured JSON for programmatic use
+
+## Install
+
+  curl -fsSL https://sniptrace.com/install.sh | sh
+
+## Docs
+
+  https://sniptrace.com/docs'
+
+      if [[ -f "$DEST" ]]; then
+        # Append to existing file, separated by a blank line
+        printf '\n%s\n' "$BLOCK" >> "$DEST"
+        echo "sniptrace: appended SnipTrace block to existing $DEST"
+      else
+        printf '%s\n' "$BLOCK" > "$DEST"
+        echo "sniptrace: wrote $DEST"
+      fi
+      exit 0
+      ;;
+
+    shell-init)
+      # Detect the user's shell config file
+      if [[ -n "${ZDOTDIR:-}" ]]; then
+        RC="$ZDOTDIR/.zshrc"
+      elif [[ "${SHELL:-}" == */zsh ]] || [[ -f "$HOME/.zshrc" ]]; then
+        RC="$HOME/.zshrc"
+      else
+        RC="$HOME/.bashrc"
+      fi
+
+      MARKER="# ── SnipTrace shell wrappers"
+
+      if grep -qF "$MARKER" "$RC" 2>/dev/null; then
+        echo "sniptrace: shell wrappers already present in $RC — nothing to do."
+        exit 0
+      fi
+
+      cat >> "$RC" << 'SHELLEOF'
+
+# ── SnipTrace shell wrappers ─────────────────────────────────────────────────
+# Added by: sniptrace shell-init
+# Noisy subcommands are automatically filtered. All others pass through unchanged.
+
+pnpm() {
+  case "${1:-}" in
+    install|i|add|ci|run) command sniptrace pnpm "$@" ;;
+    *) command pnpm "$@" ;;
+  esac
+}
+
+npm() {
+  case "${1:-}" in
+    install|i|ci|run) command sniptrace npm "$@" ;;
+    *) command npm "$@" ;;
+  esac
+}
+
+docker() {
+  case "${1:-}" in
+    build|compose) command sniptrace docker "$@" ;;
+    *) command docker "$@" ;;
+  esac
+}
+
+pytest() { command sniptrace pytest "$@"; }
+# ── end SnipTrace ─────────────────────────────────────────────────────────────
+SHELLEOF
+
+      echo "sniptrace: appended shell wrappers to $RC"
+      echo ""
+      echo "  Activate now:  source $RC"
+      echo ""
+      echo "  Wrapped commands: pnpm install/add/ci/run, npm install/ci/run,"
+      echo "                    docker build/compose, pytest"
+      echo "  Everything else passes through unchanged."
+      exit 0
+      ;;
+
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+if [[ ${#ARGS[@]} -eq 0 ]]; then
+  echo "Usage: sniptrace [--json] <command> [args...]" >&2
+  echo "       sniptrace help        # full command list" >&2
+  exit 1
+fi
+
+# ── Global off switch ────────────────────────────────────────────────────────
+# When SnipTrace is turned off (via `sniptrace off` or SNIPTRACE_DISABLED), run
+# the command completely untouched — no filtering, no telemetry, no overhead.
+# exec replaces this process, preserving stdout/stderr and the exit code exactly.
+if _is_disabled; then
+  exec "${ARGS[@]}"
+fi
+
+# ── Filter engine ────────────────────────────────────────────────────────────
+# Runs the output of the wrapped command through Python regex filters.
+# Falls back to cat (raw passthrough) if Python is unavailable or crashes.
+
+_sniptrace_filter() {
+# The program is read from the heredoc, so the captured output is passed as a
+# file path ($1) and read via argv — otherwise the heredoc would occupy stdin
+# and the command output would never reach the filter.
+python3 -u - "$1" << 'PYEOF'
+import sys
+import re
+
+STRIP = [
+    # Docker BuildKit layer lines
+    re.compile(r'^#\d+ '),
+    # Python stdlib / venv / site-packages frames (not user-code frames)
+    re.compile(r'^\s+File ".*(?:site-packages|/lib/python[\d]+[\./]).*"'),
+    # npm / pnpm deprecation and registry noise
+    re.compile(r'^(npm|pnpm) warn deprecated'),
+    re.compile(r'^npm warn EBADENGINE'),
+    re.compile(r'^npm warn old lockfile'),
+    # pnpm progress lines
+    re.compile(r'^\s*(Downloading|Extracting|Already|Resolving|Fetching|Reusing|Locking) '),
+    # pytest / unittest boilerplate
+    re.compile(r'^(platform |rootdir:|plugins:|collecting \.\.\.)'),
+    re.compile(r'^tests/.+\s+PASSED'),
+    re.compile(r'^\.\s*$'),
+    # jest boilerplate
+    re.compile(r'^(PASS|RUN) .+\.(spec|test)\.[tj]s'),
+    # General progress / spinner lines
+    re.compile(r'^\s+progress \['),
+    re.compile(r'.*\r\s*$'),
+    # pnpm / npm update banners (box-drawing characters)
+    re.compile(r'^[\s]*[╭╰│]'),
+    re.compile(r'^\s*Update available!'),
+    re.compile(r'^\s*Changelog:'),
+    re.compile(r'^\s*To update, run:'),
+]
+
+try:
+    with open(sys.argv[1], 'r', errors='replace') as _fh:
+        _data = _fh.read()
+except (IndexError, OSError):
+    _data = sys.stdin.read()
+
+buf = []
+for raw in _data.split('\n'):
+    line = raw.rstrip('\r')
+    if not any(p.match(line) for p in STRIP):
+        buf.append(line)
+
+# Trim leading/trailing blank lines
+while buf and not buf[0].strip():
+    buf.pop(0)
+while buf and not buf[-1].strip():
+    buf.pop()
+
+print('\n'.join(buf))
+PYEOF
+}
+
+# ── Run & capture ────────────────────────────────────────────────────────────
+TMPOUT=$(mktemp)
+TMPERR=$(mktemp)
+trap 'rm -f "$TMPOUT" "$TMPERR"' EXIT
+
+# Run the command; capture combined output; preserve exit code
+"${ARGS[@]}" > "$TMPOUT" 2>&1
+CMD_EXIT=$?
+
+ORIGINAL_BYTES=$(wc -c < "$TMPOUT" | tr -d ' ')
+
+# Filter (with raw passthrough safety if filter itself crashes)
+FILTERED=$(_sniptrace_filter "$TMPOUT" 2>/dev/null || cat "$TMPOUT")
+FILTERED_BYTES=${#FILTERED}
+
+if [[ "$JSON_MODE" == true ]]; then
+  # Emit structured JSON for programmatic agent consumption
+  python3 -c "
+import json, sys
+filtered = sys.stdin.read()
+original_bytes = $ORIGINAL_BYTES
+filtered_bytes = len(filtered.encode())
+reduction = round((1 - filtered_bytes / max(original_bytes, 1)) * 100, 1)
+print(json.dumps({
+    'exit_code': $CMD_EXIT,
+    'original_bytes': original_bytes,
+    'filtered_bytes': filtered_bytes,
+    'reduction_pct': reduction,
+    'output': filtered
+}, indent=2))
+" <<< "$FILTERED"
+else
+  echo "$FILTERED"
+fi
+
+# ── Telemetry (opt-in only) ──────────────────────────────────────────────────
+# Sends an anonymous count of tokens used vs saved when telemetry is ON.
+# Never blocks the command, never errors loudly. Enable with: sniptrace tele --on
+if [[ "$(_cfg_get TELEMETRY)" == "on" ]]; then
+  TELE_CID=$(_client_id)
+  TELE_TIER=$(_cfg_get TIER); TELE_TIER="${TELE_TIER:-counter}"
+  TELE_EMAIL=$(_cfg_get EMAIL)
+  TELE_FREQ=$(_cfg_get FREQUENCY)
+  TELE_CMDTYPE=$(_detect_cmdtype "${ARGS[0]}")
+  # ~4 bytes per token is a standard rough estimate.
+  TELE_USED=$(( FILTERED_BYTES / 4 ))
+  TELE_SAVED_BYTES=$(( ORIGINAL_BYTES - FILTERED_BYTES ))
+  [[ $TELE_SAVED_BYTES -lt 0 ]] && TELE_SAVED_BYTES=0
+  TELE_SAVED=$(( TELE_SAVED_BYTES / 4 ))
+  ( _sniptrace_post "$TELE_CID" "$TELE_TIER" "$TELE_CMDTYPE" "$TELE_USED" "$TELE_SAVED" "$TELE_EMAIL" "$TELE_FREQ" & )
+fi
+
+# ── Background version check ─────────────────────────────────────────────────
+# Checks once per 24 hours. Never blocks the main command. Never errors loudly.
+_sniptrace_version_check() {
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/sniptrace"
+  local cache_file="$cache_dir/version_check"
+  local now
+  now=$(date +%s 2>/dev/null) || return
+
+  # Only re-check if cache is missing or older than 86400 seconds (24h)
+  if [[ -f "$cache_file" ]]; then
+    local mtime
+    mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null) || mtime=0
+    local age=$(( now - mtime ))
+    [[ $age -lt 86400 ]] && { cat "$cache_file"; return; }
+  fi
+
+  # Fetch latest version (2s timeout, silent, no errors)
+  local latest
+  latest=$(curl -fsSL --max-time 2 https://sniptrace.com/api/v1/public/version 2>/dev/null \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['version'])" 2>/dev/null) || return
+
+  mkdir -p "$cache_dir" 2>/dev/null || return
+  echo "$latest" > "$cache_file"
+  echo "$latest"
+}
+
+_sniptrace_notify_update() {
+  local latest
+  latest=$(_sniptrace_version_check 2>/dev/null) || return
+  [[ -z "$latest" ]] && return
+
+  # Compare: only notify if latest != current
+  if [[ "$latest" != "$VERSION" ]]; then
+    echo "sniptrace: v${latest} available -- run: curl -fsSL https://sniptrace.com/install.sh | sh" >&2
+  fi
+}
+
+# Run the version check in the background so it never adds latency
+( _sniptrace_notify_update & )
+
+exit $CMD_EXIT

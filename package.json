@@ -1,0 +1,43 @@
+{
+  "name": "sniptrace",
+  "version": "1.1.0",
+  "description": "Trim noisy terminal output before it reaches your AI agent. A free, local CLI.",
+  "bin": {
+    "sniptrace": "bin/sniptrace"
+  },
+  "files": [
+    "bin/sniptrace",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "cli",
+    "ai",
+    "agent",
+    "terminal",
+    "output",
+    "filter",
+    "noise",
+    "tokens",
+    "llm",
+    "devtools"
+  ],
+  "homepage": "https://sniptrace.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j15marti/sniptrace.git"
+  },
+  "bugs": {
+    "url": "https://github.com/j15marti/sniptrace/issues"
+  },
+  "author": "Jeremy Martinez",
+  "license": "MIT",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=14"
+  }
+}
