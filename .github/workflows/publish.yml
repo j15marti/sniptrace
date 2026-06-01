@@ -3,7 +3,8 @@ name: Publish to npm
 # Publishes @sniptrace/cli to npm on every version tag (e.g. v1.1.1) and on manual
 # dispatch. Uses npm Trusted Publishing (OIDC) — no NPM_TOKEN secret required.
 # NOTE: deliberately no `registry-url` on setup-node — that writes a token-based
-# .npmrc which shadows the OIDC flow and causes E404 on publish.
+# .npmrc which shadows the OIDC flow. The npm upgrade + publish run in ONE step so
+# the upgraded npm (>= 11.5.1, required for OIDC) is the one that actually publishes.
 on:
   push:
     tags:
@@ -23,7 +24,8 @@ jobs:
         with:
           node-version: "lts/*"
 
-      # Trusted publishing requires npm >= 11.5.1
-      - run: npm install -g npm@latest
-
-      - run: npm publish --access public
+      - name: Upgrade npm and publish via OIDC
+        run: |
+          npm install -g npm@latest
+          echo "node: $(node -v)  npm: $(npm -v)  which-npm: $(which npm)"
+          npm publish --access public
