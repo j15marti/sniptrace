@@ -21,7 +21,7 @@ $ sniptrace npm run test
 ### npm
 
 ```sh
-npm install -g sniptrace
+npm install -g @sniptrace/cli
 ```
 
 ### Homebrew
