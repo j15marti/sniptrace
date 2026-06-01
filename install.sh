@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 INSTALL_DIR="${SNIPTRACE_INSTALL_DIR:-/usr/local/bin}"
 BIN="$INSTALL_DIR/sniptrace"
 

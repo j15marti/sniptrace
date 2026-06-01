@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# sniptrace v1.1.0
+# sniptrace v1.1.1
 # Strip noisy terminal output before it reaches your AI coding agent.
 # https://sniptrace.com
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 JSON_MODE=false
 ARGS=()
 
@@ -412,13 +412,26 @@ SHELLEOF
       exit 0
       ;;
 
-    *) ARGS+=("$1"); shift ;;
+    -*)
+      # Unknown sniptrace option (e.g. --status). Options only ever appear
+      # before the wrapped command, so anything starting with '-' that we did
+      # not recognise above is a mistake — point the user at the help menu.
+      echo "sniptrace: unknown option '$1'" >&2
+      echo "           Run 'sniptrace -h' or 'sniptrace --help' to see all commands." >&2
+      exit 1 ;;
+
+    *)
+      # First non-option token is the command to wrap. Everything after it
+      # (including any flags) belongs to that command and must pass through
+      # untouched — so stop parsing and hand the rest over verbatim.
+      ARGS+=("$@")
+      break ;;
   esac
 done
 
 if [[ ${#ARGS[@]} -eq 0 ]]; then
-  echo "Usage: sniptrace [--json] <command> [args...]" >&2
-  echo "       sniptrace help        # full command list" >&2
+  echo "sniptrace: no command given" >&2
+  echo "           Run 'sniptrace -h' or 'sniptrace --help' to see all commands." >&2
   exit 1
 fi
 

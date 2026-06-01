@@ -1,6 +1,6 @@
 {
-  "name": "sniptrace",
-  "version": "1.1.0",
+  "name": "@sniptrace/cli",
+  "version": "1.1.1",
   "description": "Trim noisy terminal output before it reaches your AI agent. A free, local CLI.",
   "bin": {
     "sniptrace": "bin/sniptrace"
